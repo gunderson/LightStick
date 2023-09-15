@@ -1,0 +1,309 @@
+#include <OSCMessage.h>
+#include <OSCBundle.h>
+
+#include <FastLED.h>
+#include <ESPmDNS.h>
+#include <WiFiClient.h>
+
+// Please include ArduinoOSCWiFi.h to use ArduinoOSC on the platform
+// which can use both WiFi and Ethernet
+#include <ArduinoOSCWiFi.h>
+
+//int LED_BUILTIN = 2;
+
+// FastLED
+#define DATA_PIN 21
+#define CLOCK_PIN 22
+#define COLOR_ORDER BGR
+#define CHIPSET     APA102
+#define NUM_LEDS    6
+#define BRIGHTNESS    200
+
+// OSC
+const int recv_port = 54321;        // local port to listen for UDP packets (here's where we send the packets)
+const int bind_port = 54345;
+const int send_port = 55555;
+const int publish_port = 54445;
+
+
+//Are we currently connected?
+boolean connected = false;
+
+const char* masterHost = "displayhost";
+
+IPAddress masterHostIp = IPAddress(192 | 168 << 8 | 0 << 16 | 11 << 24);
+int mdnsServiceQueryInterval = 2000;
+int mdnsServiceQueryTick = 0;
+
+String dns = "light-";
+byte mac[6];
+const char* ssid = "G7";
+const char* password = "1234qwerasdfzxcv";
+IPAddress myIP;
+
+const char* serverIndex = "<form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Update'></form>";
+
+// Define the array of leds
+CRGB leds[NUM_LEDS];
+
+/* ---------------------------------------------------------------------------------- */
+
+void setup(void) {
+  setupSerial();
+  setupFastLED();
+}
+
+void setupSerial(){
+  Serial.begin(921600);
+  Serial.println();
+  Serial.println("Booting Sketch...");
+  Serial.println(masterHostIp);
+}
+
+void setupFastLED(){
+  FastLED.addLeds<CHIPSET, DATA_PIN, CLOCK_PIN, COLOR_ORDER>(leds, NUM_LEDS);//.setCorrection( TypicalLEDStrip );
+  FastLED.setBrightness( BRIGHTNESS );
+  floodColor(CRGB::Blue);
+}
+
+void connectToWifi(){
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  WiFi.macAddress(mac);
+  dns += String(mac[1],HEX) + String(mac[0],HEX);
+  Serial.println("MDNS: "+ dns);
+  printmac();
+  if (WiFi.waitForConnectResult() == WL_CONNECTED) {
+    const char* dnsCopy = dns.c_str();
+    MDNS.begin(dnsCopy);
+
+    // Serial.printf("Ready! Open http://%s.local in your browser\n", dns);
+    Serial.print("IP Address:");
+    Serial.println(WiFi.localIP());
+    setupOSC();
+  } else {
+    Serial.println("WiFi Failed");
+  }
+}
+
+void printmac(){
+  Serial.print("MAC: ");
+  Serial.print(mac[5],HEX);
+  Serial.print(":");
+  Serial.print(mac[4],HEX);
+  Serial.print(":");
+  Serial.print(mac[3],HEX);
+  Serial.print(":");
+  Serial.print(mac[2],HEX);
+  Serial.print(":");
+  Serial.print(mac[1],HEX);
+  Serial.print(":");
+  Serial.println(mac[0],HEX);
+}
+
+/* ---------------------------------------------------------------------------------- */
+void loop() {
+  loopMDNS();
+  OscWiFi.update();
+}
+
+long mdnsQueryTime = millis();
+bool isScanning = true;
+
+void loopMDNS(){
+  if (!isScanning) return;
+  long now = millis();
+  long mdnsQueryTimeDelta = now - mdnsQueryTime;
+  if (mdnsQueryTimeDelta >= mdnsServiceQueryInterval){
+    mdnsQueryTime = now;
+    if (!masterHostIp){
+      Serial.print("Querying Master Host: ");
+      Serial.println(masterHost);
+      floodColor(CRGB::Yellow);
+      // masterHostIp = MDNS.queryHost(masterHost);  
+      if (masterHostIp){
+        Serial.print("Master Host: ");
+        Serial.println(masterHost);
+        Serial.print("  ip: ");
+        Serial.println(masterHostIp);
+        floodColor(CRGB::Green);
+        isScanning = false;
+        
+        MDNS.end();
+        registerMaster();
+      }
+    } else {
+      floodColor(CRGB::Magenta);
+      isScanning = false;
+        registerMaster();
+
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+void registerMaster(){
+    Serial.print("connecting to ");
+    Serial.println(masterHost);
+    Serial.println(masterHostIp);
+
+    // Use WiFiClient class to create TCP connections
+    WiFiClient client;
+    const int httpPort = 3000;
+    if (!client.connect(masterHostIp, httpPort)) {
+        Serial.print("connection failed");
+        Serial.println(masterHostIp);
+        return;
+    }
+
+    // We now create a URI for the request
+    String url = "/register";
+    url += "?address=";
+    url += WiFi.localIP().toString();
+    url += "&port=";
+    url += recv_port;
+    url += "&numleds=";
+    url += NUM_LEDS;
+
+    Serial.print("Requesting URL: ");
+    Serial.println(url);
+
+    // This will send the request to the server
+    client.print(String("POST ") + url + " HTTP/1.1\r\n" +
+                 "Host: " + dns + "\r\n" +
+                 "Connection: close\r\n\r\n");
+    unsigned long timeout = millis();
+    while (client.available() == 0) {
+        if (millis() - timeout > 5000) {
+            Serial.println(">>> Client Timeout !");
+            client.stop();
+            return;
+        }
+    }
+
+    // Read all the lines of the reply from server and print them to Serial
+    while(client.available()) {
+        String line = client.readStringUntil('\r');
+        Serial.print(line);
+    }
+
+    Serial.println();
+    Serial.println("closing connection");
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+void floodColor(CRGB color){
+  for( int j = 0; j < NUM_LEDS; j++) {
+      leds[j] = color;
+    }
+    FastLED.show();
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+int lastLEDTime = millis();
+
+void onLed(OSCMessage &msg, int addrOffset) {
+  // if it's my address
+  boolean isBlob = msg.isBlob(0);
+  int blobLength = msg.getBlobLength(0);
+  int blobCounter = blobLength;
+  uint8_t blob[blobLength];
+  while(blobCounter--){
+    int index = blobLength - blobCounter - 1;
+    msg.getBlob(index, &blob[index]);
+  }
+
+  if (blobLength / 3 != NUM_LEDS){
+    Serial.printf("LED count mismatch: %d / %d \n", blobLength / 3, NUM_LEDS);
+  }
+
+  for( int i = 0; i < blobLength; i += 3) {
+    leds[i/3] = CRGB(blob[i],blob[i+1],blob[i+2]);
+  }
+  
+  int ledDelta  = millis() - lastLEDTime;
+  Serial.print("LED Delta:");
+  Serial.println(ledDelta);
+  lastLEDTime = millis();
+  
+}
+
+int lastDrawTime = millis();
+
+void onDraw(OSCMessage &msg, int addrOffset) {
+  int drawDelta  = millis() - lastDrawTime;
+  // Serial.print("Draw Delta:");
+  // Serial.println(drawDelta);
+  FastLED.show();
+  lastDrawTime = millis();
+}
+
+
+void setupOSC(){
+    // publish osc messages (default publish rate = 30 [Hz])
+
+    // OscWiFi.publish(host, publish_port, "/publish/value", i, f, s)
+    //     ->setFrameRate(60.f);
+
+    // OscWiFi.publish(host, publish_port, "/publish/func", &millis, &micros)
+    //     ->setIntervalMsec(500.f);
+
+    // subscribe osc messages
+
+    // OscWiFi.subscribe(bind_port, "/bind/values", i, f, s);
+
+    OscWiFi.subscribe(recv_port, "/led", onLed);
+    OscWiFi.subscribe(recv_port, "/draw", onDraw);
+}
+
+
+
+/* ---------------------------------------------------------------------------------- */
+
+
+void browseService(const char * service, const char * proto){
+    Serial.printf("Browsing for service _%s._%s.local. ... ", service, proto);
+    int n = MDNS.queryService(service, proto);
+    if (n == 0) {
+        Serial.println("no services found");
+        floodColor(CRGB::Red);
+    } else {
+        Serial.print(n);
+        Serial.println(" service(s) found");
+        for (int i = 0; i < n; ++i) {
+            // Print details for each service found
+            Serial.print("  ");
+            Serial.print(i + 1);
+            Serial.print(": ");
+            Serial.print(MDNS.hostname(i));
+            Serial.print(" (");
+            Serial.print(MDNS.IP(i));
+            Serial.print(":");
+            Serial.print(MDNS.port(i));
+            Serial.println(")");
+
+            if (MDNS.hostname(i) == masterHost){
+              masterHostIp = MDNS.IP(i);
+            }
+            registerMaster();
+        }
+    }
+    Serial.println();
+}
+
+void nameFound(const char* name, IPAddress ip)
+{
+  if (ip != INADDR_NONE) {
+    Serial.print("The IP address for '");
+    Serial.print(name);
+    Serial.print("' is ");
+    Serial.println(ip);
+  } else {
+    Serial.print("Resolving '");
+    Serial.print(name);
+    Serial.println("' timed out.");
+  }
+}
